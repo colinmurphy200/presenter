@@ -31,7 +31,7 @@ html,body{margin:0;height:100%;background:#000;color:var(--ink);overflow:hidden;
   font-size:13px;color:#fff;background:rgba(0,0,0,.45);padding:2px 9px;border-radius:999px;pointer-events:none;display:none}
 #tools{position:fixed;top:max(10px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));z-index:8;display:flex;flex-wrap:wrap;gap:2px;padding:4px;
   background:rgba(28,30,35,.9);border:1px solid var(--line);border-radius:14px;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);touch-action:manipulation;max-width:calc(100vw - 20px)}
-#tools[hidden]{display:none}
+#tools[hidden],#tools button[hidden]{display:none}
 #tools button{width:44px;height:44px;border:0;border-radius:10px;background:transparent;color:#e8eaee;display:grid;place-items:center;cursor:pointer;padding:0}
 #tools button.on,#tools.drawing [data-ink=mouse]{background:#41464f}
 #tools button:focus-visible{outline:2px solid var(--acc)}
@@ -66,6 +66,8 @@ table{border-collapse:collapse;width:100%;font-size:14px}
 td{padding:5px 0;border-top:1px solid var(--line);vertical-align:top}
 td:first-child{color:var(--ink);white-space:nowrap;padding-right:14px}td:last-child{color:var(--mute)}
 .hint{font-size:14px}
+.seg{gap:6px}.seg .seglabel{color:var(--ink);margin-right:6px}.seg .btn.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn[hidden]{display:none}
 kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid var(--line);border-radius:5px;padding:0 5px}
 </style>
 </head>
@@ -80,6 +82,8 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
   <span class="sep"></span>
   <button data-ink="undo" title="Undo (U or Cmd+Z)" aria-label="Undo"><svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button>
   <button data-ink="clear" title="Clear this slide's ink" aria-label="Clear this slide"><svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
+  <button data-ink="blank" title="Insert a blank page after this one (A)" aria-label="Insert blank page"><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/></svg></button>
+  <button data-ink="delblank" title="Delete this blank page" aria-label="Delete this blank page" hidden><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M9 14h6"/></svg></button>
   <button data-ink="mouse" title="Draw with mouse/trackpad (D)" aria-label="Draw with mouse"><svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6z"/></svg></button>
   <button data-ink="hide" title="Hide tools" aria-label="Hide tools"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
 </div>
@@ -110,7 +114,14 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
     <div class="row">
       <button class="btn" data-act="annotate">Annotate</button>
       <button class="btn" data-act="export">Save annotated PDF…</button>
-      <button class="btn" data-act="clearall">Clear all ink</button>
+      <button class="btn" data-act="clearall">Clear all ink &amp; blank pages</button>
+    </div>
+    <div class="row">
+      <button class="btn" data-act="blank">Insert blank page</button>
+      <button class="btn" data-act="delblank" hidden>Delete this blank page</button>
+    </div>
+    <div class="row seg" role="group" aria-label="Blank page style"><span class="seglabel">Blank pages</span>
+      <button class="btn" data-style="lined">Lined</button><button class="btn" data-style="grid">Grid</button><button class="btn" data-style="plain">Plain</button>
     </div>
     <form id="goform" class="row"><input id="goto" type="text" inputmode="numeric" placeholder="Frame" aria-label="Frame number"><button class="btn">Go</button></form>
     <label class="set">Fade within a frame <output id="o-fadeIn"></output><input id="fadeIn" type="range" min="0" max="800" step="20"></label>
@@ -125,6 +136,7 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
       <tr><td>Back after a link</td><td><kbd>Alt</kbd>+<kbd>←</kbd> or the Back button</td></tr>
       <tr><td>Write</td><td>Just use the Apple Pencil; fingers still navigate and zoom. On the Mac press <kbd>D</kbd> to draw with the mouse or trackpad, <kbd>E</kbd> for the eraser</td></tr>
       <tr><td>Undo ink</td><td><kbd>U</kbd> or <kbd>Cmd</kbd>+<kbd>Z</kbd></td></tr>
+      <tr><td>Blank page</td><td>The page-with-plus button in the toolbar, <kbd>A</kbd>, or this menu; repeat for more pages. Choose lined, grid or plain above</td></tr>
       <tr><td>Blank screen</td><td><kbd>B</kbd> black, <kbd>W</kbd> white</td></tr>
       <tr><td>Fullscreen</td><td><kbd>F</kbd></td></tr>
     </table>

@@ -22,15 +22,27 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('op:' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('op:' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
 };
-const cfg = Object.assign({ fadeIn: 280, fadeFrame: 0, showNum: false }, store.get('cfg', {}));
+const cfg = Object.assign({ fadeIn: 280, fadeFrame: 0, showNum: false, blankStyle: 'lined' }, store.get('cfg', {}));
 const MAX_ZOOM = 12;
 
 // ---------- document state ----------
-let pdf = null, docKey = '', labels = null, numPages = 0, pageSize = null;
-const pages = [];                 // resolved PDFPageProxy by index
+let pdf = null, docKey = '', labels = null, numPages = 0, pageSize = null, pdfCount = 0;
+const pages = [];                 // resolved PDFPageProxy by PDF page index
 const pagePromises = new Map();
-const linkCache = new Map();      // idx -> { list, promise }
-const linkHistory = [];
+const linkCache = new Map();      // PDF page index -> { list, promise }
+const linkHistory = [];           // slots to return to after following a link
+
+// The deck as shown: PDF pages in order, with any inserted blank pages after the page they follow.
+// A slot is { p } for PDF page p, or { b: id, style, after } for an inserted blank page.
+let seq = [], pdfSlots = [], blanks = {};   // blanks: PDF index -> [blank slots, in order]
+const slotKey = (sl) => (sl.b ? 'b' + sl.b : 'p' + sl.p);
+function rebuildSeq() {
+  seq = [];
+  for (let p = 0; p < pdfCount; p++) { seq.push(pdfSlots[p]); for (const bl of blanks[p] || []) seq.push(bl); }
+  numPages = seq.length;
+  if (layer && seq.includes(layer.slot)) { layer.idx = seq.indexOf(layer.slot); target = layer.idx; }
+}
+const seqIndexOfPdf = (p) => seq.indexOf(pdfSlots[p]);
 
 // ---------- layout + view ----------
 // Slide box is W x H CSS px. A point p in "fit" coordinates appears at s*p + t in the box.
@@ -43,10 +55,43 @@ let target = 0;          // index we are heading to (updated synchronously)
 let navToken = 0;
 const backdrops = new Map();  // idx -> { gen, promise, canvas }
 
-function getPage(i) {
+function getPage(i) {        // i = PDF page index
   let p = pagePromises.get(i);
   if (!p) { p = pdf.getPage(i + 1).then((pg) => (pages[i] = pg)); pagePromises.set(i, p); }
   return p;
+}
+
+// ---------- blank pages: ruling, drawn in page units (origin bottom-left, y up) ----------
+function rulingOf(style) {
+  const w = pageSize.w, h = pageSize.h, lw = (w / 1200) * 1.1, out = [];
+  if (style === 'lined') {
+    const gap = h / 16;
+    for (let y = h - gap * 1.6; y > gap * 0.5; y -= gap) out.push([0, y, w, y, '#b9cde6', lw]);
+    out.push([w * 0.08, 0, w * 0.08, h, '#e6a3a3', lw]);
+  } else if (style === 'grid') {
+    const c = h / 24;
+    for (let x = c; x < w - 1e-6; x += c) out.push([x, 0, x, h, '#d3dae3', lw]);
+    for (let y = h - c; y > 1e-6; y -= c) out.push([0, y, w, y, '#d3dae3', lw]);
+  }
+  return out;
+}
+const blankTransform = () => [fitScale, 0, 0, -fitScale, 0, H];   // page units -> fit CSS px
+function drawBlank(canvas, style, v) {
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(dpr * v.s, 0, 0, dpr * v.s, dpr * v.tx, dpr * v.ty);
+  ctx.transform(...blankTransform());
+  for (const [x1, y1, x2, y2, c, lw] of rulingOf(style)) {
+    ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+}
+// page units <-> fit CSS px for any slot
+function slotTransform(sl) { return sl.b ? blankTransform() : pages[sl.p].getViewport({ scale: fitScale }).transform; }
+function slotReady(sl) { return !!(sl && (sl.b || pages[sl.p])); }
+function fitToPage(sl, px, py) {
+  if (sl.b) return [px / fitScale, (H - py) / fitScale];
+  return pages[sl.p].getViewport({ scale: fitScale }).convertToPdfPoint(px, py);
 }
 
 function newCanvas(cls) {
@@ -74,20 +119,27 @@ function layout() {
 
 // Full-page render at fit size; cached and prefetched so stepping is instant.
 function backdrop(i) {
-  const e = backdrops.get(i);
+  const sl = seq[i], key = slotKey(sl);
+  const e = backdrops.get(key);
   if (e && e.gen === gen) return e.promise;
   const canvas = newCanvas('backdrop');
-  const promise = getPage(i)
-    .then((pg) => pg.render({ canvas, viewport: pg.getViewport({ scale: fitScale * dpr }) }).promise)
-    .then(() => canvas);
+  let promise;
+  if (sl.b) { drawBlank(canvas, sl.style, { s: 1, tx: 0, ty: 0 }); promise = Promise.resolve(canvas); }
+  else {
+    promise = getPage(sl.p)
+      .then((pg) => pg.render({ canvas, viewport: pg.getViewport({ scale: fitScale * dpr }) }).promise)
+      .then(() => canvas);
+  }
   promise.catch(() => {});
-  backdrops.set(i, { gen, promise, canvas });
+  backdrops.set(key, { gen, promise, canvas });
   return promise;
 }
 function prefetch(i) {
   for (const j of [i + 1, i - 1, i + 2]) if (j >= 0 && j < numPages) { backdrop(j); loadLinks(j); }
-  for (const [j, e] of backdrops) {
-    if ((j < i - 2 || j > i + 3) && !e.canvas.isConnected) { freeCanvas(e.canvas); backdrops.delete(j); }
+  const keep = new Set();
+  for (let j = i - 2; j <= i + 3; j++) if (seq[j]) keep.add(slotKey(seq[j]));
+  for (const [k, e] of backdrops) {
+    if (!keep.has(k) && !e.canvas.isConnected) { freeCanvas(e.canvas); backdrops.delete(k); }
   }
 }
 
@@ -96,13 +148,13 @@ function makeLayer(i, bd) {
   const el = document.createElement('div');
   el.className = 'layer';
   el.appendChild(bd);
-  return { idx: i, el, bd, detail: null, ds: null, task: null };
+  return { idx: i, slot: seq[i], el, bd, detail: null, ds: null, task: null };
 }
 function dropLayer(l) {
   if (!l) return;
   if (l.task) { l.task.cancel(); l.task = null; }
   freeCanvas(l.detail); l.detail = null;
-  if (backdrops.get(l.idx)?.canvas !== l.bd) freeCanvas(l.bd);
+  if (backdrops.get(slotKey(l.slot))?.canvas !== l.bd) freeCanvas(l.bd);
   l.el.remove();
 }
 function place(l) {
@@ -139,7 +191,14 @@ async function renderDetail(l) {
   if (l.task) { l.task.cancel(); l.task = null; }
   if (view.s <= 1.0001) { freeCanvas(l.detail); l.detail = null; return; }
   const v = { s: view.s, tx: view.tx, ty: view.ty };
-  const pg = await getPage(l.idx);
+  if (l.slot.b) {                                   // blank page: draw the ruling directly
+    const c = newCanvas('detail');
+    drawBlank(c, l.slot.style, v);
+    freeCanvas(l.detail);
+    l.detail = c; l.ds = v; l.el.appendChild(c); place(l);
+    return;
+  }
+  const pg = await getPage(l.slot.p);
   const c = newCanvas('detail');
   const task = pg.render({
     canvas: c,
@@ -157,7 +216,15 @@ async function renderDetail(l) {
 }
 
 // ---------- navigation ----------
-const sameFrame = (a, b) => (labels ? labels[a] === labels[b] : true);
+// Two shown pages are steps of one frame when they are PDF pages with the same Beamer label
+// (without labels, every PDF page fades into the next). Blank pages are never part of a frame.
+function sameFrame(a, b) {
+  const x = seq[a], y = seq[b];
+  if (!x || !y || x.b || y.b) return false;
+  return labels ? labels[x.p] === labels[y.p] : true;
+}
+const sameLabel = (a, b) => !!(labels && seq[a] && seq[b] && !seq[a].b && !seq[b].b && labels[seq[a].p] === labels[seq[b].p]);
+function pdfFrameStart(p) { while (labels && p > 0 && labels[p - 1] === labels[p]) p--; return p; }
 function resetView() { view.s = 1; view.tx = 0; view.ty = 0; }
 
 async function goTo(i, opts = {}) {
@@ -195,28 +262,32 @@ async function goTo(i, opts = {}) {
   if (old) placeAll();
   loadLinks(i);
   prefetch(i);
-  store.set('pos:' + docKey, i);
+  store.set('pos:' + docKey, slotKey(seq[i]));
+  updateTools();
   updateNum();
 }
 const next = () => goTo(target + 1);
 const prev = () => goTo(target - 1);
-function frameStart(i) { while (labels && i > 0 && labels[i - 1] === labels[i]) i--; return i; }
-function frameEnd(i) { while (labels && i < numPages - 1 && labels[i + 1] === labels[i]) i++; return i; }
+function frameStart(i) { while (i > 0 && sameLabel(i - 1, i)) i--; return i; }
+function frameEnd(i) { while (i < numPages - 1 && sameLabel(i + 1, i)) i++; return i; }
 const nextFrame = () => goTo(frameEnd(target) + 1);
 const prevFrame = () => goTo(frameStart(target) - 1);
-function back() { if (linkHistory.length) goTo(linkHistory.pop()); }
+function back() {
+  while (linkHistory.length) { const i = seq.indexOf(linkHistory.pop()); if (i >= 0) { goTo(i); return; } }
+}
 function goLabel(str) {
   str = String(str).trim();
   if (!str) return;
-  let i = labels ? labels.indexOf(str) : -1;
-  if (i < 0 && /^\d+$/.test(str)) i = +str - 1;
-  if (i >= 0 && i < numPages) { linkHistory.push(target); goTo(i); } else toast('No frame ' + str);
+  let p = labels ? labels.indexOf(str) : -1;
+  if (p < 0 && /^\d+$/.test(str)) p = +str - 1;
+  if (p >= 0 && p < pdfCount) { linkHistory.push(seq[target]); goTo(seqIndexOfPdf(p)); } else toast('No frame ' + str);
 }
 function updateNum() {
   numEl.style.display = cfg.showNum && pdf ? 'block' : 'none';
   if (!cfg.showNum || !pdf) return;
-  const a = frameStart(target), b = frameEnd(target);
-  const lab = labels ? labels[target] : String(target + 1);
+  const a = frameStart(target), b = frameEnd(target), sl = seq[target];
+  const pl = (p) => (labels ? labels[p] : String(p + 1));
+  const lab = sl.b ? `${pl(sl.after)} · blank ${blanks[sl.after].indexOf(sl) + 1}` : pl(sl.p);
   numEl.textContent = b > a ? `${lab} · ${target - a + 1}/${b - a + 1}` : lab;
 }
 
@@ -236,7 +307,10 @@ function zoomAt(factor, cx, cy) {
 function resetZoom() { resetView(); placeAll(); scheduleDetail(0); }
 
 // ---------- links ----------
-function loadLinks(i) {
+function loadLinks(j) {        // j = shown-page index
+  const sl = seq[j];
+  if (!sl || sl.b) return Promise.resolve([]);
+  const i = sl.p;
   if (linkCache.has(i)) return linkCache.get(i).promise;
   const entry = { list: null };
   entry.promise = getPage(i)
@@ -250,8 +324,9 @@ function loadLinks(i) {
 }
 function hitLink(cx, cy, slopPx = 0) {
   if (!layer) return null;
-  const list = linkCache.get(layer.idx)?.list;
-  const pg = pages[layer.idx];
+  if (layer.slot.b) return null;
+  const list = linkCache.get(layer.slot.p)?.list;
+  const pg = pages[layer.slot.p];
   if (!list || !list.length || !pg) return null;
   const b = boxPoint(cx, cy);
   const px = (b.x - view.tx) / view.s, py = (b.y - view.ty) / view.s;
@@ -286,8 +361,8 @@ async function follow(k) {
     if (!Array.isArray(d)) return;
     const ref = d[0];
     const idx = typeof ref === 'number' ? ref : await pdf.getPageIndex(ref);
-    linkHistory.push(target);
-    goTo(idx);
+    linkHistory.push(seq[target]);
+    goTo(seqIndexOfPdf(idx));
   } catch (e) { toast('Link target not found'); }
 }
 
@@ -462,6 +537,7 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'd') setDrawMode(!ink.drawMode);
   else if (k === 'e') { setTool('eraser'); setDrawMode(true); }
   else if (k === 'u') undoInk();
+  else if (k === 'a') insertBlank();
   else if (k === 'i') { cfg.showNum = !cfg.showNum; store.set('cfg', cfg); updateNum(); }
   else handled = false;
   if (!/^[0-9]$/.test(k) && k !== 'Shift') numBuf = '';
@@ -486,11 +562,15 @@ function toggleFullscreen() {
 function openMenu() {
   for (const id of ['fadeIn', 'fadeFrame']) { $(id).value = cfg[id]; $('o-' + id).textContent = cfg[id] ? cfg[id] + ' ms' : 'off'; }
   $('showNum').checked = cfg.showNum;
+  for (const b of document.querySelectorAll('[data-style]')) b.classList.toggle('on', b.dataset.style === cfg.blankStyle);
+  updateTools();
   menuEl.hidden = false;
 }
 function closeMenu() { menuEl.hidden = true; }
 menuEl.addEventListener('click', (e) => {
   if (e.target === menuEl) { closeMenu(); return; }
+  const st = e.target.closest('[data-style]')?.dataset.style;
+  if (st) { setBlankStyle(st); return; }
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (!act) return;
   if (act === 'close') closeMenu();
@@ -501,6 +581,8 @@ menuEl.addEventListener('click', (e) => {
   else if (act === 'annotate') { closeMenu(); setDrawMode(true); }
   else if (act === 'export') { closeMenu(); exportAnnotated(); }
   else if (act === 'clearall') { clearInk(true); closeMenu(); }
+  else if (act === 'blank') { closeMenu(); insertBlank(); }
+  else if (act === 'delblank') { closeMenu(); deleteCurrentBlank(); }
 });
 for (const id of ['fadeIn', 'fadeFrame']) {
   $(id).addEventListener('input', () => {
@@ -537,7 +619,14 @@ function sizeInk() {
   inkCanvas.width = Math.max(1, Math.round(W * dpr)); inkCanvas.height = Math.max(1, Math.round(H * dpr));
   inkCanvas.style.width = W + 'px'; inkCanvas.style.height = H + 'px';
 }
-const shownOn = (s, i) => s.frame === frameStart(i) && s.page <= i;
+// Ink on a PDF page belongs to its frame and shows from the step it was written on;
+// ink on a blank page belongs to that blank page.
+function shownOn(s, i) {
+  const sl = seq[i];
+  if (!sl) return false;
+  if (sl.b) return s.blank === sl.b;
+  return !s.blank && s.frame === pdfFrameStart(sl.p) && s.page <= sl.p;
+}
 function strokePath(ctx, p) {           // smoothed: quadratic curves through midpoints
   ctx.moveTo(p[0], p[1]);
   if (p.length <= 2) { ctx.lineTo(p[0] + 0.01, p[1]); return; }
@@ -554,10 +643,10 @@ function queueInk() { if (!inkQueued) { inkQueued = true; requestAnimationFrame(
 function redrawInk() {
   inkCtx.setTransform(1, 0, 0, 1, 0, 0);
   inkCtx.clearRect(0, 0, inkCanvas.width, inkCanvas.height);
-  if (!pdf || !layer || !pages[layer.idx]) return;
+  if (!pdf || !layer || !slotReady(layer.slot)) return;
   const i = layer.idx;
   inkCtx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.tx, dpr * view.ty);
-  inkCtx.transform(...pages[i].getViewport({ scale: fitScale }).transform);
+  inkCtx.transform(...slotTransform(layer.slot));
   inkCtx.lineCap = 'round'; inkCtx.lineJoin = 'round';
   for (const s of ink.strokes) if (shownOn(s, i)) drawStroke(inkCtx, s);
   if (ink.active && ink.active.stroke) drawStroke(inkCtx, ink.active.stroke);
@@ -565,12 +654,12 @@ function redrawInk() {
 }
 function toPdf(cx, cy) {
   const b = boxPoint(cx, cy);
-  return pages[layer.idx].getViewport({ scale: fitScale }).convertToPdfPoint((b.x - view.tx) / view.s, (b.y - view.ty) / view.s);
+  return fitToPage(layer.slot, (b.x - view.tx) / view.s, (b.y - view.ty) / view.s);
 }
 const unitsPerPx = () => 1 / (fitScale * view.s);   // PDF units per CSS pixel on screen
 
 function startInk(e) {
-  if (!layer || !pages[layer.idx]) return;
+  if (!layer || !slotReady(layer.slot)) return;
   try { stage.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
   commitFade();
   if (e.pointerType === 'pen') ink.lastPen = performance.now();
@@ -579,7 +668,8 @@ function startInk(e) {
   if (ink.tool === 'eraser') { ink.active = { id: e.pointerId, removed: [] }; eraseAt(x, y); }
   else {
     const t = TOOLS[ink.tool] || TOOLS.red;
-    ink.active = { id: e.pointerId, stroke: { page: layer.idx, frame: frameStart(layer.idx), color: t.color, w: strokeWidth(t), a: t.a, pts: [x, y] } };
+    const sl = layer.slot, where = sl.b ? { blank: sl.b } : { page: sl.p, frame: pdfFrameStart(sl.p) };
+    ink.active = { id: e.pointerId, stroke: { ...where, color: t.color, w: strokeWidth(t), a: t.a, pts: [x, y] } };
   }
   queueInk();
 }
@@ -625,16 +715,92 @@ function undoInk() {
   if (!u) { toast('Nothing to undo'); return; }
   if (u.add) ink.strokes = ink.strokes.filter((s) => !u.add.includes(s));
   if (u.removed) ink.strokes.push(...u.removed);
+  if (u.addBlank) { removeBlank(u.addBlank, false); toast('Blank page removed'); }
+  if (u.delBlank) {
+    const bl = u.delBlank, list = blanks[bl.after] || (blanks[bl.after] = []);
+    list.splice(Math.min(u.pos, list.length), 0, bl);
+    if (u.strokesOnPage) ink.strokes.push(...u.strokesOnPage);
+    rebuildSeq(); saveBlanks();
+    goTo(seq.indexOf(bl), { cut: true });
+  }
+  if (u.blanks) { blanks = u.blanks; rebuildSeq(); saveBlanks(); updateTools(); }
   saveInk(); queueInk();
 }
 function clearInk(all) {
   const i = layer ? layer.idx : 0;
   const removed = ink.strokes.filter((s) => all || shownOn(s, i));
-  if (!removed.length) { toast(all ? 'No annotations' : 'No ink on this slide'); return; }
+  const hadBlanks = all && Object.keys(blanks).length > 0;
+  if (!removed.length && !hadBlanks) { toast(all ? 'No annotations' : 'No ink on this slide'); return; }
   ink.strokes = ink.strokes.filter((s) => !removed.includes(s));
-  ink.undo.push({ removed });
-  saveInk(); queueInk();
-  toast(all ? 'All annotations cleared — undo restores them' : 'Slide cleared — undo restores it');
+  const entry = { removed };
+  if (hadBlanks) {
+    entry.blanks = blanks; blanks = {};
+    const cur = layer && layer.slot;
+    rebuildSeq(); saveBlanks();
+    if (cur && cur.b) goTo(seqIndexOfPdf(cur.after), { cut: true, force: true });
+  }
+  ink.undo.push(entry);
+  saveInk(); queueInk(); updateTools();
+  toast(all ? 'All ink and blank pages cleared — undo restores them' : 'Slide cleared — undo restores it');
+}
+
+// ---------- inserting and removing blank pages ----------
+let blankCounter = 0;
+function insertBlank(style = cfg.blankStyle) {
+  if (!pdf || !layer) return;
+  const cur = layer.slot, after = cur.b ? cur.after : cur.p;
+  const list = blanks[after] || (blanks[after] = []);
+  const bl = { b: Date.now().toString(36) + (blankCounter++).toString(36), style, after };
+  list.splice(cur.b ? list.indexOf(cur) + 1 : 0, 0, bl);
+  rebuildSeq(); saveBlanks();
+  ink.undo.push({ addBlank: bl });
+  goTo(seq.indexOf(bl), { cut: true });
+}
+function removeBlank(bl, record = true) {
+  const list = blanks[bl.after], pos = list ? list.indexOf(bl) : -1;
+  if (pos < 0) return;
+  const wasShowing = layer && layer.slot === bl, i = seq.indexOf(bl);
+  list.splice(pos, 1);
+  if (!list.length) delete blanks[bl.after];
+  const strokes = ink.strokes.filter((s) => s.blank === bl.b);
+  ink.strokes = ink.strokes.filter((s) => s.blank !== bl.b);
+  if (record) ink.undo.push({ delBlank: bl, pos, strokesOnPage: strokes });
+  rebuildSeq(); saveBlanks(); saveInk();
+  if (wasShowing) goTo(Math.max(0, i - 1), { cut: true, force: true });
+  updateTools();
+}
+function deleteCurrentBlank() {
+  if (!layer || !layer.slot.b) return;
+  removeBlank(layer.slot);
+  toast('Blank page deleted — undo restores it');
+}
+function setBlankStyle(style) {
+  cfg.blankStyle = style; store.set('cfg', cfg);
+  for (const b of document.querySelectorAll('[data-style]')) b.classList.toggle('on', b.dataset.style === style);
+  if (layer && layer.slot.b && layer.slot.style !== style) {   // restyle the blank page on screen
+    layer.slot.style = style; saveBlanks();
+    backdrops.delete(slotKey(layer.slot));
+    goTo(layer.idx, { cut: true, force: true });
+  }
+}
+function updateTools() {
+  const onBlank = !!(layer && layer.slot && layer.slot.b);
+  const del = toolsEl && toolsEl.querySelector('[data-ink=delblank]');
+  if (del) del.hidden = !onBlank;
+  const mdel = document.querySelector('[data-act=delblank]');
+  if (mdel) mdel.hidden = !onBlank;
+}
+let blankSaveTimer = 0;
+function saveBlanks() {
+  clearTimeout(blankSaveTimer);
+  const key = 'blanks:' + docKey;
+  const data = Object.values(blanks).flat().map(({ b, style, after }) => ({ b, style, after }));
+  blankSaveTimer = setTimeout(() => idb.put(key, data), 300);
+}
+async function loadBlanks() {
+  blanks = {};
+  const saved = await idb.get('blanks:' + docKey);
+  if (Array.isArray(saved)) for (const bl of saved) if (bl.after < pdfCount) (blanks[bl.after] || (blanks[bl.after] = [])).push({ ...bl });
 }
 let inkSaveTimer = 0;
 function saveInk() {
@@ -644,7 +810,8 @@ function saveInk() {
 }
 async function loadInk() {
   const saved = await idb.get('ink:' + docKey);
-  ink.strokes = Array.isArray(saved) ? saved.filter((s) => s.page < numPages) : [];
+  const ids = new Set(Object.values(blanks).flat().map((bl) => bl.b));
+  ink.strokes = Array.isArray(saved) ? saved.filter((s) => (s.blank ? ids.has(s.blank) : s.page < pdfCount)) : [];
   ink.undo = [];
   if (ink.strokes.length) toast(`${ink.strokes.length} saved annotation${ink.strokes.length > 1 ? 's' : ''} restored`);
 }
@@ -667,6 +834,8 @@ toolsEl.addEventListener('click', (e) => {
   else if (b.dataset.ink === 'undo') undoInk();
   else if (b.dataset.ink === 'clear') clearInk(false);
   else if (b.dataset.ink === 'mouse') setDrawMode(!ink.drawMode);
+  else if (b.dataset.ink === 'blank') insertBlank();
+  else if (b.dataset.ink === 'delblank') deleteCurrentBlank();
   else if (b.dataset.ink === 'hide') { setDrawMode(false); showTools(false); }
 });
 setTool(ink.tool);
@@ -674,7 +843,7 @@ setTool(ink.tool);
 // Apple Pencil taps on buttons don't always produce a click event in iPad Safari, so a pen
 // tap on a control is turned into a click here (and any native click that follows is dropped).
 let penClick = { el: null, t: 0 };
-const PRESSABLE = 'button, label.btn, label.chk, [data-act], [data-save], [data-tool], [data-ink]';
+const PRESSABLE = 'button, label.btn, label.chk, [data-act], [data-save], [data-tool], [data-ink], [data-style]';
 document.addEventListener('pointerup', (e) => {
   if (e.pointerType !== 'pen') return;
   const el = e.target.closest && e.target.closest(PRESSABLE);
@@ -709,14 +878,19 @@ function svgPathOf(p) {            // same smoothing as on screen; y negated for
 async function buildAnnotatedPdf() {
   const { PDFDocument, rgb, LineCapStyle } = await loadPdfLib();
   const doc = await PDFDocument.load(origBytes.slice(), { updateMetadata: false });
+  const hex = (c) => { const n = parseInt(c.slice(1), 16); return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255); };
+  seq.forEach((sl, j) => { if (sl.b) doc.insertPage(j, [pageSize.w, pageSize.h]); });   // blank pages in place
   const out = doc.getPages();
-  for (let i = 0; i < out.length && i < numPages; i++) {
+  for (let j = 0; j < seq.length && j < out.length; j++) {
+    if (seq[j].b) {
+      for (const [x1, y1, x2, y2, c, lw] of rulingOf(seq[j].style)) {
+        out[j].drawLine({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, thickness: lw, color: hex(c) });
+      }
+    }
     for (const s of ink.strokes) {
-      if (!shownOn(s, i)) continue;
-      const n = parseInt(s.color.slice(1), 16);
-      out[i].drawSvgPath(svgPathOf(s.pts), {
-        x: 0, y: 0, borderWidth: s.w, borderOpacity: s.a, borderLineCap: LineCapStyle.Round,
-        borderColor: rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255),
+      if (!shownOn(s, j)) continue;
+      out[j].drawSvgPath(svgPathOf(s.pts), {
+        x: 0, y: 0, borderWidth: s.w, borderOpacity: s.a, borderLineCap: LineCapStyle.Round, borderColor: hex(s.color),
       });
     }
   }
@@ -725,7 +899,7 @@ async function buildAnnotatedPdf() {
 let readyBlob = null, readyName = '';
 async function exportAnnotated() {
   if (!pdf) return;
-  if (!ink.strokes.length) { toast('No annotations to save yet'); return; }
+  if (!ink.strokes.length && !Object.keys(blanks).length) { toast('No annotations to save yet'); return; }
   toast('Preparing annotated PDF…', 15000);
   try {
     const bytes = await buildAnnotatedPdf();
@@ -802,6 +976,7 @@ function closeDoc() {
   commitFade(); dropLayer(layer); layer = null;
   for (const e of backdrops.values()) freeCanvas(e.canvas);
   backdrops.clear(); pagePromises.clear(); pages.length = 0; linkCache.clear(); linkHistory.length = 0;
+  seq = []; pdfSlots = []; blanks = {}; numPages = 0;
   ink.strokes = []; ink.undo = []; ink.active = null;
   resetView();
 }
@@ -813,17 +988,22 @@ async function openData(data, name) {
     const opts = { data, enableXfa: false };
     if (localPdfjs) { opts.standardFontDataUrl = ASSET('./pdfjs/standard_fonts/'); opts.wasmUrl = ASSET('./pdfjs/wasm/'); }
     pdf = await pdfjsLib.getDocument(opts).promise;
-    numPages = pdf.numPages;
+    pdfCount = pdf.numPages;
+    pdfSlots = Array.from({ length: pdfCount }, (_, p) => ({ p }));
     labels = await pdf.getPageLabels().catch(() => null);
     const vp = (await getPage(0)).getViewport({ scale: 1 });
     pageSize = { w: vp.width, h: vp.height };
-    docKey = name + ':' + numPages;
+    docKey = name + ':' + pdfCount;
+    await loadBlanks();
+    rebuildSeq();
     await loadInk();
     layout();
     startEl.hidden = true; closeMenu();
-    const saved = Math.min(numPages - 1, Math.max(0, store.get('pos:' + docKey, 0)));
+    const pos = store.get('pos:' + docKey, 0);   // a slot key ('p3', 'b…'), or a page index from older versions
+    let saved = typeof pos === 'number' ? seqIndexOfPdf(Math.min(pdfCount - 1, Math.max(0, pos))) : seq.findIndex((sl) => slotKey(sl) === pos);
+    if (saved < 0) saved = 0;
     await goTo(saved, { cut: true, force: true });
-    if (saved > 0) toast(`Resumed at frame ${labels ? labels[saved] : saved + 1}`);
+    if (saved > 0) toast(seq[saved].b ? 'Resumed on a blank page' : `Resumed at frame ${labels ? labels[seq[saved].p] : seq[saved].p + 1}`);
   } catch (e) {
     pdf = null;
     startEl.hidden = false;
@@ -857,4 +1037,4 @@ window.visualViewport?.addEventListener('resize', onResize);
 })();
 
 // Hook for automated tests.
-window.__op = { get state() { return { target, layer: layer && layer.idx, fading: !!fading, view: { ...view }, W, H, numPages, labels, detail: !!(layer && layer.detail), strokes: ink.strokes.length }; }, ink, buildAnnotatedPdf, linkCache, pages, goTo, fitScale: () => fitScale, openData };
+window.__op = { get state() { return { target, layer: layer && layer.idx, fading: !!fading, view: { ...view }, W, H, numPages, labels, detail: !!(layer && layer.detail), strokes: ink.strokes.length, slot: layer && slotKey(layer.slot), seqLen: seq.length }; }, ink, buildAnnotatedPdf, insertBlank, setBlankStyle, linkCache, pages, goTo, fitScale: () => fitScale, openData };
