@@ -497,6 +497,9 @@ const TOOLS = {
   black: { color: '#111111', w: 2.6, a: 1 },
   hl: { color: '#ffd400', w: 16, a: 0.38 },
 };
+// Widths above are CSS px on a slide shown 1200 px wide; strokes keep that width relative
+// to the slide whatever the zoom or screen, so ink written zoomed-in matches the rest.
+const strokeWidth = (t) => t.w * pageSize.w / 1200;
 const ink = { strokes: [], undo: [], active: null, drawMode: false, lastPen: 0, tool: store.get('tool', 'red') };
 const inkCanvas = $('ink'), inkCtx = inkCanvas.getContext('2d'), toolsEl = $('tools');
 let origBytes = null, docName = 'slides.pdf';
@@ -547,7 +550,7 @@ function startInk(e) {
   if (ink.tool === 'eraser') { ink.active = { id: e.pointerId, removed: [] }; eraseAt(x, y); }
   else {
     const t = TOOLS[ink.tool] || TOOLS.red;
-    ink.active = { id: e.pointerId, stroke: { page: layer.idx, frame: frameStart(layer.idx), color: t.color, w: t.w * unitsPerPx(), a: t.a, pts: [x, y] } };
+    ink.active = { id: e.pointerId, stroke: { page: layer.idx, frame: frameStart(layer.idx), color: t.color, w: strokeWidth(t), a: t.a, pts: [x, y] } };
   }
   queueInk();
 }
@@ -638,6 +641,23 @@ toolsEl.addEventListener('click', (e) => {
   else if (b.dataset.ink === 'hide') { setDrawMode(false); showTools(false); }
 });
 setTool(ink.tool);
+
+// Apple Pencil taps on buttons don't always produce a click event in iPad Safari, so a pen
+// tap on a control is turned into a click here (and any native click that follows is dropped).
+let penClick = { el: null, t: 0 };
+const PRESSABLE = 'button, label.btn, label.chk, [data-act], [data-save], [data-tool], [data-ink]';
+document.addEventListener('pointerup', (e) => {
+  if (e.pointerType !== 'pen') return;
+  const el = e.target.closest && e.target.closest(PRESSABLE);
+  if (!el || stage.contains(el)) return;
+  penClick = { el, t: performance.now() };
+  el.click();
+}, true);
+document.addEventListener('click', (e) => {
+  if (!e.isTrusted || !penClick.el || performance.now() - penClick.t > 700) return;
+  const el = e.target.closest && e.target.closest(PRESSABLE);
+  if (el === penClick.el) { e.stopImmediatePropagation(); e.preventDefault(); penClick.el = null; }
+}, true);
 
 // ---------- export: strokes become vector paths in the original PDF ----------
 function loadScript(src) {
