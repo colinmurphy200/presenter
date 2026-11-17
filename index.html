@@ -32,6 +32,7 @@ html,body{margin:0;height:100%;background:#000;color:var(--ink);overflow:hidden;
 #tools{position:fixed;top:max(10px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));z-index:8;display:flex;flex-wrap:wrap;gap:2px;padding:4px;
   background:rgba(28,30,35,.9);border:1px solid var(--line);border-radius:14px;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);touch-action:manipulation;max-width:calc(100vw - 20px)}
 #tools[hidden],#tools button[hidden]{display:none}
+@media (pointer:coarse){#tools [data-ink=mouse]{display:none}}  /* mouse-draw switch is for the Mac only */
 #tools button{width:44px;height:44px;border:0;border-radius:10px;background:transparent;color:#e8eaee;display:grid;place-items:center;cursor:pointer;padding:0}
 #tools button.on,#tools.drawing [data-ink=mouse]{background:#41464f}
 #tools button:focus-visible{outline:2px solid var(--acc)}
