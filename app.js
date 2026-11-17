@@ -299,6 +299,7 @@ function cancelPress() { clearTimeout(pressTimer); }
 
 stage.addEventListener('pointerdown', (e) => {
   if (!pdf || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  recoverStale(e);
   if (ink.active) return;                                     // ignore palm/fingers while writing
   if (e.pointerType === 'pen' || (ink.drawMode && e.pointerType === 'mouse')) { startInk(e); return; }
   if (e.pointerType === 'touch' && performance.now() - ink.lastPen < 350) return;  // palm just after the pencil lifts
@@ -364,6 +365,34 @@ function endPointer(e) {
 }
 stage.addEventListener('pointerup', endPointer);
 stage.addEventListener('pointercancel', endPointer);
+
+// iPadOS can swallow a lift (pointerup) — e.g. when it cancels touches around the Pencil or the
+// lift lands outside the stage. A lost lift would leave a finger or pen "down" forever, which
+// blocks taps and long-press. These guards notice and clear such stale state.
+function recoverStale(e) {
+  // A primary touch means no other finger is on the screen, so any tracked finger is stale.
+  if (e.pointerType === 'touch' && e.isPrimary && ptrs.size) { ptrs.clear(); g = null; cancelPress(); }
+  if (ink.active) {
+    const penIdle = performance.now() - ink.lastPen > 1500;
+    if (e.pointerType !== 'touch' || (e.isPrimary && penIdle)) endInk();
+  }
+}
+function lostLift(e) {
+  if (stage.contains(e.target)) return;            // the stage's own handlers deal with it
+  if (ink.active && e.pointerId === ink.active.id) endInk();
+  else if (ptrs.has(e.pointerId)) { ptrs.delete(e.pointerId); cancelPress(); if (!ptrs.size) g = null; }
+}
+window.addEventListener('pointerup', lostLift, true);
+window.addEventListener('pointercancel', lostLift, true);
+stage.addEventListener('lostpointercapture', (e) => {
+  setTimeout(() => {                                // let a normal pointerup run first
+    if (ink.active && e.pointerId === ink.active.id) endInk();
+    else if (ptrs.has(e.pointerId)) { ptrs.delete(e.pointerId); if (!ptrs.size) g = null; }
+  }, 0);
+});
+function resetInput() { ptrs.clear(); g = null; cancelPress(); if (ink.active) endInk(); }
+window.addEventListener('blur', resetInput);
+document.addEventListener('visibilitychange', () => { if (document.hidden) resetInput(); });
 
 function tap(x, y, type) {
   const k = hitLink(x, y, type === 'mouse' ? 0 : 8);
