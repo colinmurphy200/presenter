@@ -39,6 +39,15 @@ html,body{margin:0;height:100%;background:#000;color:var(--ink);overflow:hidden;
 #tools i.hl{border-radius:3px;background:#ffd400;width:11px;height:22px;transform:rotate(35deg);border-color:#fff3a0}
 #tools .sep{width:1px;background:var(--line);margin:8px 3px}
 #tools svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.strip{position:fixed;left:0;right:0;bottom:0;z-index:9;background:rgba(16,17,21,.95);border-top:1px solid var(--line);
+  padding:10px max(12px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
+  overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;touch-action:pan-x;overscroll-behavior:contain}
+.strip[hidden]{display:none}
+.strip-inner{display:flex;gap:8px;width:max-content}
+.thumb{flex:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:5px;border:0;border-radius:9px;background:transparent;color:#c9ced6;font:13px/1.2 -apple-system,system-ui,sans-serif;cursor:pointer}
+.thumb canvas{display:block;background:#fff;border-radius:3px;box-shadow:0 1px 5px rgba(0,0,0,.55)}
+.thumb.cur{background:#26365a;color:#fff}.thumb.cur canvas{outline:2px solid var(--acc);outline-offset:1px}
+.thumb:focus-visible{outline:2px solid var(--acc)}
 #toast{position:fixed;left:50%;bottom:max(28px,env(safe-area-inset-bottom));transform:translateX(-50%);z-index:30;
   background:rgba(20,22,26,.92);color:#fff;padding:8px 16px;border-radius:10px;font-size:15px;opacity:0;transition:opacity .2s;pointer-events:none;white-space:nowrap}
 #toast.on{opacity:1}
@@ -83,11 +92,13 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
   <span class="sep"></span>
   <button data-ink="undo" title="Undo (U or Cmd+Z)" aria-label="Undo"><svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button>
   <button data-ink="clear" title="Clear this slide's ink" aria-label="Clear this slide"><svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
+  <button data-ink="strip" title="Slide strip (T)" aria-label="Slide strip"><svg viewBox="0 0 24 24"><rect x="2.5" y="7" width="5.5" height="10" rx="1"/><rect x="9.25" y="7" width="5.5" height="10" rx="1"/><rect x="16" y="7" width="5.5" height="10" rx="1"/></svg></button>
   <button data-ink="blank" title="Insert a blank page after this one (A)" aria-label="Insert blank page"><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/></svg></button>
   <button data-ink="delblank" title="Delete this blank page" aria-label="Delete this blank page" hidden><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M9 14h6"/></svg></button>
   <button data-ink="mouse" title="Draw with mouse/trackpad (D)" aria-label="Draw with mouse"><svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6z"/></svg></button>
   <button data-ink="hide" title="Hide tools" aria-label="Hide tools"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
 </div>
+<div id="strip" class="strip" hidden><div id="stripInner" class="strip-inner"></div></div>
 <div id="curtain"></div>
 <div id="num"></div>
 <div id="toast"></div>
@@ -107,6 +118,7 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
 <div id="menu" class="overlay" hidden>
   <div class="card">
     <div class="row" style="margin-top:0">
+      <button class="btn primary" data-act="strip">Slide strip</button>
       <button class="btn" data-act="open">Open PDF…</button>
       <button class="btn" data-act="fs">Fullscreen</button>
       <button class="btn" data-act="fit">Reset zoom</button>
@@ -133,7 +145,7 @@ kbd{font:13px ui-monospace,Menlo,monospace;background:#111317;border:1px solid v
       <tr><td>Next / previous</td><td>Tap right / left quarter, swipe, click, <kbd>→</kbd> <kbd>←</kbd>, <kbd>Space</kbd>, clicker</td></tr>
       <tr><td>Skip overlays</td><td><kbd>Shift</kbd>+<kbd>→</kbd> / <kbd>←</kbd>, or <kbd>]</kbd> <kbd>[</kbd></td></tr>
       <tr><td>Zoom</td><td>Pinch (touch or trackpad), <kbd>+</kbd> <kbd>−</kbd>; drag to pan; <kbd>Esc</kbd> resets</td></tr>
-      <tr><td>Go to frame</td><td>Type the number, then <kbd>Enter</kbd></td></tr>
+      <tr><td>Go to frame</td><td>Slide strip (this menu, the toolbar, or <kbd>T</kbd>): scroll sideways and tap a thumbnail. Or type the number, then <kbd>Enter</kbd></td></tr>
       <tr><td>Back after a link</td><td><kbd>Alt</kbd>+<kbd>←</kbd> or the Back button</td></tr>
       <tr><td>Write</td><td>Just use the Apple Pencil; fingers still navigate and zoom. On the Mac press <kbd>D</kbd> to draw with the mouse or trackpad, <kbd>E</kbd> for the eraser</td></tr>
       <tr><td>Move writing</td><td>Lasso tool (toolbar, or <kbd>L</kbd>): draw a loop round it, then drag inside the dashed box with the Pencil or a finger. The bin (or <kbd>Delete</kbd>) deletes the selection</td></tr>

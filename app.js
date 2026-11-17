@@ -376,6 +376,7 @@ function cancelPress() { clearTimeout(pressTimer); }
 stage.addEventListener('pointerdown', (e) => {
   if (!pdf || (e.pointerType === 'mouse' && e.button !== 0)) return;
   recoverStale(e);
+  if (!stripEl.hidden && !ink.active) { closeStrip(); return; }
   if (ink.active) return;                                     // ignore palm/fingers while writing
   if (ink.sel.length && ptrs.size === 0 && inSelection(e.clientX, e.clientY)) { startMove(e); return; }
   if (e.pointerType === 'pen' || (ink.drawMode && e.pointerType === 'mouse')) { startInk(e); return; }
@@ -507,7 +508,7 @@ document.addEventListener('gesturechange', (e) => {
   zoomAt((gs0 * e.scale) / view.s, b.x, b.y);
 }, { passive: false });
 document.addEventListener('gestureend', (e) => e.preventDefault(), { passive: false });
-document.addEventListener('touchmove', (e) => { if (!e.target.closest('.card')) e.preventDefault(); }, { passive: false });
+document.addEventListener('touchmove', (e) => { if (!e.target.closest('.card, .strip')) e.preventDefault(); }, { passive: false });
 
 // ---------- keyboard ----------
 let numBuf = '';
@@ -530,8 +531,10 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'Home') goTo(0);
   else if (k === 'End') goTo(numPages - 1);
   else if (k === 'f') toggleFullscreen();
+  else if (k === 'Escape' && !stripEl.hidden) closeStrip();
   else if (k === 'Escape') { if (numBuf) numBuf = ''; else if (ink.sel.length) clearSelection(); else resetZoom(); }
   else if (k === 'l') { setTool('lasso'); setDrawMode(true); }
+  else if (k === 't') toggleStrip();
   else if (k === '+' || k === '=') zoomAt(1.25, W / 2, H / 2);
   else if (k === '-' || k === '_') zoomAt(0.8, W / 2, H / 2);
   else if (k === 'b' || k === '.') toggleCurtain('black');
@@ -586,6 +589,7 @@ menuEl.addEventListener('click', (e) => {
   else if (act === 'export') { closeMenu(); exportAnnotated(); }
   else if (act === 'clearall') { clearInk(true); closeMenu(); }
   else if (act === 'blank') { closeMenu(); insertBlank(); }
+  else if (act === 'strip') openStrip();
   else if (act === 'delblank') { closeMenu(); deleteCurrentBlank(); }
 });
 for (const id of ['fadeIn', 'fadeFrame']) {
@@ -919,6 +923,7 @@ toolsEl.addEventListener('click', (e) => {
   else if (b.dataset.ink === 'clear') { if (ink.sel.length) deleteSelection(); else clearInk(false); }
   else if (b.dataset.ink === 'mouse') setDrawMode(!ink.drawMode);
   else if (b.dataset.ink === 'blank') insertBlank();
+  else if (b.dataset.ink === 'strip') toggleStrip();
   else if (b.dataset.ink === 'delblank') deleteCurrentBlank();
   else if (b.dataset.ink === 'hide') { setDrawMode(false); showTools(false); }
 });
@@ -927,7 +932,7 @@ setTool(ink.tool);
 // Apple Pencil taps on buttons don't always produce a click event in iPad Safari, so a pen
 // tap on a control is turned into a click here (and any native click that follows is dropped).
 let penClick = { el: null, t: 0 };
-const PRESSABLE = 'button, label.btn, label.chk, [data-act], [data-save], [data-tool], [data-ink], [data-style]';
+const PRESSABLE = 'button, label.btn, label.chk, [data-act], [data-save], [data-tool], [data-ink], [data-style], .thumb';
 document.addEventListener('pointerup', (e) => {
   if (e.pointerType !== 'pen') return;
   const el = e.target.closest && e.target.closest(PRESSABLE);
@@ -1020,6 +1025,89 @@ $('saveready').addEventListener('click', (e) => {
   else if (act === 'cancel' || e.target === $('saveready')) $('saveready').hidden = true;
 });
 
+// ---------- slide strip: thumbnails to jump around the deck ----------
+const stripEl = $('strip'), stripInner = $('stripInner');
+let thumbObserver = null;
+function stripEntries() {      // one per frame (pictured fully revealed, entered at its first step) and per blank page
+  const out = [];
+  for (let i = 0; i < seq.length; i++) {
+    const sl = seq[i];
+    if (sl.b) { out.push({ go: i, show: i, label: 'blank' }); continue; }
+    if (frameStart(i) !== i) continue;
+    out.push({ go: i, show: frameEnd(i), label: labels ? labels[sl.p] : String(sl.p + 1) });
+  }
+  return out;
+}
+function openStrip() {
+  if (!pdf) return;
+  closeMenu();
+  const tw = Math.round(Math.min(180, Math.max(110, window.innerWidth / 7.5))), th = Math.round((tw * pageSize.h) / pageSize.w);
+  if (thumbObserver) thumbObserver.disconnect();
+  for (const c of stripInner.querySelectorAll('canvas')) freeCanvas(c);
+  stripInner.textContent = '';
+  thumbObserver = new IntersectionObserver((ents) => {
+    for (const en of ents) if (en.isIntersecting) { thumbObserver.unobserve(en.target); renderThumb(en.target); }
+  }, { root: stripEl, rootMargin: '0px 600px' });
+  for (const en of stripEntries()) {
+    const b = document.createElement('button');
+    b.className = 'thumb'; b.dataset.thumb = en.go; b.dataset.show = en.show;
+    const c = document.createElement('canvas');
+    c.width = Math.round(tw * dpr); c.height = Math.round(th * dpr); c.style.width = tw + 'px'; c.style.height = th + 'px';
+    const lab = document.createElement('span'); lab.textContent = en.label;
+    b.append(c, lab);
+    if (target >= en.go && target <= en.show) b.classList.add('cur');
+    stripInner.appendChild(b);
+    thumbObserver.observe(b);
+  }
+  stripEl.hidden = false;
+  const cur = stripInner.querySelector('.cur');
+  if (cur) stripEl.scrollLeft = cur.offsetLeft - (stripEl.clientWidth - cur.offsetWidth) / 2;
+}
+function closeStrip() {
+  if (stripEl.hidden) return;
+  stripEl.hidden = true;
+  if (thumbObserver) thumbObserver.disconnect();
+  for (const c of stripInner.querySelectorAll('canvas')) freeCanvas(c);
+  stripInner.textContent = '';
+}
+const toggleStrip = () => (stripEl.hidden ? openStrip() : closeStrip());
+async function renderThumb(btn) {
+  const i = +btn.dataset.show, sl = seq[i], c = btn.querySelector('canvas');
+  if (!sl || !c || !c.width) return;
+  const ctx = c.getContext('2d');
+  try {
+    if (sl.b) {
+      const k = c.width / pageSize.w;
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      ctx.setTransform(k, 0, 0, -k, 0, c.height);
+      for (const [x1, y1, x2, y2, col, lw] of rulingOf(sl.style)) {
+        ctx.strokeStyle = col; ctx.lineWidth = Math.max(lw, 0.7 / k);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+    } else {
+      const pg = await getPage(sl.p);
+      const vp = pg.getViewport({ scale: c.width / pg.getViewport({ scale: 1 }).width });
+      await pg.render({ canvas: c, viewport: vp }).promise;
+      if (!c.width) return;                       // strip closed meanwhile
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.transform(...vp.transform);
+    }
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const minW = 1.4 / Math.hypot(ctx.getTransform().a, ctx.getTransform().b);   // keep ink visible when small
+    for (const s of ink.strokes) if (shownOn(s, i)) drawStroke(ctx, { ...s, w: Math.max(s.w, minW) });
+    ctx.globalAlpha = 1;
+  } catch { /* closed or cancelled */ }
+}
+stripEl.addEventListener('click', (e) => {
+  const b = e.target.closest('.thumb');
+  if (!b) return;
+  const i = +b.dataset.thumb;
+  closeStrip();
+  if (seq[i] && i !== target) { linkHistory.push(seq[target]); goTo(i); }
+});
+stripEl.addEventListener('wheel', (e) => {     // a vertical wheel scrolls the strip sideways
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) { stripEl.scrollLeft += e.deltaY * (e.deltaMode === 1 ? 16 : 1); e.preventDefault(); }
+}, { passive: false });
+
 // ---------- opening files ----------
 const idb = {
   open() {
@@ -1057,6 +1145,7 @@ async function openFile(f) {
   await openData(new Uint8Array(buf), f.name);
 }
 function closeDoc() {
+  closeStrip();
   commitFade(); dropLayer(layer); layer = null;
   for (const e of backdrops.values()) freeCanvas(e.canvas);
   backdrops.clear(); pagePromises.clear(); pages.length = 0; linkCache.clear(); linkHistory.length = 0;
@@ -1067,7 +1156,7 @@ function closeDoc() {
 async function openData(data, name) {
   try {
     origBytes = data.slice(); docName = name;
-    if (pdf) { const old = pdf; pdf = null; closeDoc(); old.destroy(); }
+    if (pdf) { const old = pdf; pdf = null; closeDoc(); old.loadingTask.destroy().catch(() => {}); }   // PDF.js 6: close via its loading task
     const pdfjsLib = await pdfjsReady;  // also settles localPdfjs
     const opts = { data, enableXfa: false };
     if (localPdfjs) { opts.standardFontDataUrl = ASSET('./pdfjs/standard_fonts/'); opts.wasmUrl = ASSET('./pdfjs/wasm/'); }
@@ -1100,6 +1189,7 @@ let rzTimer = 0;
 function onResize() { clearTimeout(rzTimer); rzTimer = setTimeout(relayout, 120); }
 function relayout() {
   if (!pdf || !pageSize) return;
+  closeStrip();
   commitFade(); layout(); resetView();
   goTo(target, { cut: true, force: true });
 }
