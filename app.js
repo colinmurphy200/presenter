@@ -258,6 +258,7 @@ async function goTo(i, opts = {}) {
     fading = { old, neu: nl, timer: setTimeout(commitFade, dur + 40) };
   } else if (old) dropLayer(old);
   layer = nl;
+  ink.sel = [];
   redrawInk();
   if (old) placeAll();
   loadLinks(i);
@@ -376,6 +377,7 @@ stage.addEventListener('pointerdown', (e) => {
   if (!pdf || (e.pointerType === 'mouse' && e.button !== 0)) return;
   recoverStale(e);
   if (ink.active) return;                                     // ignore palm/fingers while writing
+  if (ink.sel.length && ptrs.size === 0 && inSelection(e.clientX, e.clientY)) { startMove(e); return; }
   if (e.pointerType === 'pen' || (ink.drawMode && e.pointerType === 'mouse')) { startInk(e); return; }
   if (e.pointerType === 'touch' && performance.now() - ink.lastPen < 350) return;  // palm just after the pencil lifts
   try { stage.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -521,13 +523,15 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'Enter' && numBuf) { goLabel(numBuf); numBuf = ''; }
   else if (k === 'ArrowLeft' && e.altKey) back();
   else if (['ArrowRight', 'ArrowDown', 'PageDown', ' ', 'Enter', 'n'].includes(k)) (e.shiftKey ? nextFrame() : next());
+  else if ((k === 'Delete' || k === 'Backspace') && ink.sel.length) deleteSelection();
   else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace', 'p'].includes(k)) (e.shiftKey ? prevFrame() : prev());
   else if (k === ']') nextFrame();
   else if (k === '[') prevFrame();
   else if (k === 'Home') goTo(0);
   else if (k === 'End') goTo(numPages - 1);
   else if (k === 'f') toggleFullscreen();
-  else if (k === 'Escape') { if (numBuf) numBuf = ''; else resetZoom(); }
+  else if (k === 'Escape') { if (numBuf) numBuf = ''; else if (ink.sel.length) clearSelection(); else resetZoom(); }
+  else if (k === 'l') { setTool('lasso'); setDrawMode(true); }
   else if (k === '+' || k === '=') zoomAt(1.25, W / 2, H / 2);
   else if (k === '-' || k === '_') zoomAt(0.8, W / 2, H / 2);
   else if (k === 'b' || k === '.') toggleCurtain('black');
@@ -611,7 +615,7 @@ const TOOLS = {
 // Widths above are CSS px on a slide shown 1200 px wide; strokes keep that width relative
 // to the slide whatever the zoom or screen, so ink written zoomed-in matches the rest.
 const strokeWidth = (t) => t.w * pageSize.w / 1200;
-const ink = { strokes: [], undo: [], active: null, drawMode: false, lastPen: 0, tool: store.get('tool', 'red') };
+const ink = { strokes: [], undo: [], active: null, sel: [], drawMode: false, lastPen: 0, tool: store.get('tool', 'red') };
 const inkCanvas = $('ink'), inkCtx = inkCanvas.getContext('2d'), toolsEl = $('tools');
 let origBytes = null, docName = 'slides.pdf';
 
@@ -648,9 +652,78 @@ function redrawInk() {
   inkCtx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.tx, dpr * view.ty);
   inkCtx.transform(...slotTransform(layer.slot));
   inkCtx.lineCap = 'round'; inkCtx.lineJoin = 'round';
-  for (const s of ink.strokes) if (shownOn(s, i)) drawStroke(inkCtx, s);
+  const sel = new Set(ink.sel), u = unitsPerPx();
+  for (const s of ink.strokes) {
+    if (!shownOn(s, i)) continue;
+    if (sel.has(s)) {                                 // blue halo under selected strokes
+      inkCtx.globalAlpha = 0.35; inkCtx.strokeStyle = '#4f8cff'; inkCtx.lineWidth = s.w + 7 * u;
+      inkCtx.beginPath(); strokePath(inkCtx, s.pts); inkCtx.stroke();
+    }
+    drawStroke(inkCtx, s);
+  }
   if (ink.active && ink.active.stroke) drawStroke(inkCtx, ink.active.stroke);
   inkCtx.globalAlpha = 1;
+  inkCtx.strokeStyle = '#2f6fe8'; inkCtx.lineWidth = 1.5 * u; inkCtx.setLineDash([6 * u, 4 * u]);
+  if (ink.sel.length) { const [x1, y1, x2, y2] = selBox(); inkCtx.strokeRect(x1, y1, x2 - x1, y2 - y1); }
+  const lp = ink.active && ink.active.lasso;
+  if (lp && lp.length >= 4) {
+    inkCtx.beginPath(); inkCtx.moveTo(lp[0], lp[1]);
+    for (let k = 2; k < lp.length; k += 2) inkCtx.lineTo(lp[k], lp[k + 1]);
+    inkCtx.closePath(); inkCtx.stroke();
+  }
+  inkCtx.setLineDash([]);
+}
+// ---------- lasso selection ----------
+function selBox() {          // bounding box of the selection in page units, padded on screen
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  for (const s of ink.sel) {
+    const p = s.pts, r = s.w / 2;
+    for (let k = 0; k < p.length; k += 2) {
+      x1 = Math.min(x1, p[k] - r); x2 = Math.max(x2, p[k] + r);
+      y1 = Math.min(y1, p[k + 1] - r); y2 = Math.max(y2, p[k + 1] + r);
+    }
+  }
+  const pad = 8 * unitsPerPx();
+  return [x1 - pad, y1 - pad, x2 + pad, y2 + pad];
+}
+function inSelection(cx, cy) {
+  if (!ink.sel.length || !layer || !slotReady(layer.slot)) return false;
+  const [x, y] = toPdf(cx, cy), [x1, y1, x2, y2] = selBox();
+  return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+}
+function insidePoly(x, y, poly) {
+  let inside = false;
+  for (let a = 0, b = poly.length - 2; a < poly.length; b = a, a += 2) {
+    const xa = poly[a], ya = poly[a + 1], xb = poly[b], yb = poly[b + 1];
+    if ((ya > y) !== (yb > y) && x < ((xb - xa) * (y - ya)) / (yb - ya) + xa) inside = !inside;
+  }
+  return inside;
+}
+function finishLasso(poly) {
+  ink.sel = [];
+  if (poly.length >= 6) {
+    for (const s of ink.strokes) {
+      if (!shownOn(s, layer.idx)) continue;
+      let n = 0; const p = s.pts;
+      for (let k = 0; k < p.length; k += 2) if (insidePoly(p[k], p[k + 1], poly)) n++;
+      if (n * 2 >= p.length / 2) ink.sel.push(s);       // at least half of its points inside the loop
+    }
+  }
+}
+function clearSelection() { if (ink.sel.length) { ink.sel = []; queueInk(); } }
+function startMove(e) {
+  try { stage.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+  commitFade();
+  const [x, y] = toPdf(e.clientX, e.clientY);
+  ink.active = { id: e.pointerId, move: { x0: x, y0: y, dx: 0, dy: 0 } };
+}
+function deleteSelection() {
+  const removed = ink.sel.filter((s) => ink.strokes.includes(s));
+  ink.strokes = ink.strokes.filter((s) => !removed.includes(s));
+  ink.sel = [];
+  if (removed.length) ink.undo.push({ removed });
+  saveInk(); queueInk();
+  toast('Selection deleted — undo restores it');
 }
 function toPdf(cx, cy) {
   const b = boxPoint(cx, cy);
@@ -665,7 +738,8 @@ function startInk(e) {
   if (e.pointerType === 'pen') ink.lastPen = performance.now();
   showTools(true);
   const [x, y] = toPdf(e.clientX, e.clientY);
-  if (ink.tool === 'eraser') { ink.active = { id: e.pointerId, removed: [] }; eraseAt(x, y); }
+  if (ink.tool === 'lasso') { ink.sel = []; ink.active = { id: e.pointerId, lasso: [x, y] }; }
+  else if (ink.tool === 'eraser') { ink.active = { id: e.pointerId, removed: [] }; eraseAt(x, y); }
   else {
     const t = TOOLS[ink.tool] || TOOLS.red;
     const sl = layer.slot, where = sl.b ? { blank: sl.b } : { page: sl.p, frame: pdfFrameStart(sl.p) };
@@ -681,6 +755,11 @@ function moveInk(e) {
     if (a.stroke) {
       const p = a.stroke.pts, n = p.length;
       if (Math.hypot(x - p[n - 2], y - p[n - 1]) >= minD) p.push(x, y);
+    } else if (a.lasso) a.lasso.push(x, y);
+    else if (a.move) {
+      const m = a.move, dx = x - m.x0 - m.dx, dy = y - m.y0 - m.dy;
+      for (const s of ink.sel) for (let k = 0; k < s.pts.length; k += 2) { s.pts[k] += dx; s.pts[k + 1] += dy; }
+      m.dx += dx; m.dy += dy;
     } else eraseAt(x, y);
   }
   if (e.pointerType === 'pen') ink.lastPen = performance.now();
@@ -689,6 +768,8 @@ function moveInk(e) {
 function endInk() {
   const a = ink.active; ink.active = null;
   if (a.stroke) { ink.strokes.push(a.stroke); ink.undo.push({ add: [a.stroke] }); }
+  else if (a.lasso) finishLasso(a.lasso);
+  else if (a.move) { if (a.move.dx || a.move.dy) ink.undo.push({ moved: [...ink.sel], dx: a.move.dx, dy: a.move.dy }); }
   else if (a.removed.length) ink.undo.push({ removed: a.removed });
   if (ink.undo.length > 300) ink.undo.shift();
   ink.lastPen = performance.now();
@@ -713,6 +794,8 @@ function eraseAt(x, y) {
 function undoInk() {
   const u = ink.undo.pop();
   if (!u) { toast('Nothing to undo'); return; }
+  ink.sel = [];
+  if (u.moved) for (const s of u.moved) for (let k = 0; k < s.pts.length; k += 2) { s.pts[k] -= u.dx; s.pts[k + 1] -= u.dy; }
   if (u.add) ink.strokes = ink.strokes.filter((s) => !u.add.includes(s));
   if (u.removed) ink.strokes.push(...u.removed);
   if (u.addBlank) { removeBlank(u.addBlank, false); toast('Blank page removed'); }
@@ -818,6 +901,7 @@ async function loadInk() {
 
 // toolbar
 function setTool(t) {
+  if (t !== 'lasso') clearSelection();
   ink.tool = t; store.set('tool', t);
   for (const b of toolsEl.querySelectorAll('[data-tool]')) b.classList.toggle('on', b.dataset.tool === t);
 }
@@ -832,7 +916,7 @@ toolsEl.addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.tool) setTool(b.dataset.tool);
   else if (b.dataset.ink === 'undo') undoInk();
-  else if (b.dataset.ink === 'clear') clearInk(false);
+  else if (b.dataset.ink === 'clear') { if (ink.sel.length) deleteSelection(); else clearInk(false); }
   else if (b.dataset.ink === 'mouse') setDrawMode(!ink.drawMode);
   else if (b.dataset.ink === 'blank') insertBlank();
   else if (b.dataset.ink === 'delblank') deleteCurrentBlank();
@@ -977,7 +1061,7 @@ function closeDoc() {
   for (const e of backdrops.values()) freeCanvas(e.canvas);
   backdrops.clear(); pagePromises.clear(); pages.length = 0; linkCache.clear(); linkHistory.length = 0;
   seq = []; pdfSlots = []; blanks = {}; numPages = 0;
-  ink.strokes = []; ink.undo = []; ink.active = null;
+  ink.strokes = []; ink.undo = []; ink.active = null; ink.sel = [];
   resetView();
 }
 async function openData(data, name) {
