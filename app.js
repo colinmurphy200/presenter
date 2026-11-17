@@ -4,14 +4,36 @@
 const PDFJS_VERSION = '6.5.438';
 const CDN = globalThis.__PDFJS_BASE || `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/`;
 const ASSET = (p) => new URL(p, import.meta.url).href;
-let localPdfjs = true;
+// Look for PDF.js next to the app (GitHub copy), in a pdfjs/ folder (zip copy), then on the CDN.
+let localPdfjs = false;          // true when the full pdfjs/ folder (with fonts and decoders) is present
 const pdfjsReady = (async () => {
-  let lib;
-  try { lib = await import('./pdfjs/pdf.min.mjs'); }
-  catch { localPdfjs = false; lib = await import(CDN + 'pdf.min.mjs'); }
-  lib.GlobalWorkerOptions.workerSrc = localPdfjs ? ASSET('./pdfjs/pdf.worker.min.mjs') : CDN + 'pdf.worker.min.mjs';
-  return lib;
+  for (const base of ['./', './pdfjs/', CDN]) {
+    try {
+      const root = base === CDN ? CDN : ASSET(base);
+      const lib = await import(root + 'pdf.min.mjs');
+      await setWorker(lib, root, base === CDN);
+      localPdfjs = base === './pdfjs/';
+      return lib;
+    } catch { /* try the next place */ }
+  }
+  throw new Error('PDF.js could not be loaded');
 })();
+// For the CDN build, start PDF.js's worker from a fetched copy of its code: that fetch goes through the
+// offline cache, so the worker starts with no network too. (Inside claude.ai such fetches are not
+// allowed, and PDF.js loads the worker itself.)
+async function setWorker(lib, root, fromCdn) {
+  const src = root + 'pdf.worker.min.mjs';
+  if (fromCdn) {
+    try {
+      const r = await fetch(src);
+      if (!r.ok) throw new Error(String(r.status));
+      const url = URL.createObjectURL(new Blob([await r.text()], { type: 'text/javascript' }));
+      lib.GlobalWorkerOptions.workerPort = new Worker(url, { type: 'module' });
+      return;
+    } catch { /* fall back below */ }
+  }
+  lib.GlobalWorkerOptions.workerSrc = src;
+}
 pdfjsReady.catch(() => {});
 
 const $ = (id) => document.getElementById(id);
@@ -952,9 +974,10 @@ function loadScript(src) {
 }
 async function loadPdfLib() {
   if (window.PDFLib) return window.PDFLib;
-  try { await loadScript(ASSET('./vendor/pdf-lib.min.js')); }
-  catch { await loadScript('https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js'); }
-  return window.PDFLib;
+  for (const src of [ASSET('./pdf-lib.min.js'), ASSET('./vendor/pdf-lib.min.js'), 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js']) {
+    try { await loadScript(src); if (window.PDFLib) return window.PDFLib; } catch { /* try the next place */ }
+  }
+  throw new Error('pdf-lib could not be loaded');
 }
 function svgPathOf(p) {            // same smoothing as on screen; y negated for drawSvgPath's flip
   const f = (v) => +v.toFixed(3);
@@ -1200,6 +1223,11 @@ window.visualViewport?.addEventListener('resize', onResize);
 })();
 
 // ---------- start ----------
+// Offline cache: after one visit the app runs with no network (see sw.js). Not available inside
+// the claude.ai page, where registration simply fails.
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 (async () => {
   const last = await idb.get('last');
   if (last && last.buf) {
